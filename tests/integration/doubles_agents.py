@@ -361,6 +361,9 @@ class _Answers(BaseHTTPRequestHandler):
             self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}"
         )
         self.endpoint.asked.append(asked)
+        if self.path.rstrip("/").endswith("/messages"):
+            self._messages(asked)
+            return
         # The first line only: a prompt asked for a shape in words carries the schema below.
         said = next(
             (
@@ -402,6 +405,106 @@ class _Answers(BaseHTTPRequestHandler):
         )
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
+        self.close_connection = True
+
+    def _messages(self, asked: dict[str, Any]) -> None:
+        """The Messages protocol used by an installed DSH 0.2 runtime, with real tool use."""
+        messages: list[dict[str, Any]] = asked["messages"]
+
+        def prompt(message: dict[str, Any]) -> str:
+            return next(
+                (
+                    part
+                    for part in _parts(message.get("content"))
+                    if not part.startswith((REMINDER, RUNTIME_CONTEXT, OPERATOR_NOTE))
+                ),
+                "",
+            )
+
+        def tool_results(message: dict[str, Any]) -> list[dict[str, Any]]:
+            return [
+                cast("dict[str, Any]", block)
+                for block in message.get("content", [])
+                if isinstance(block, dict)
+                and cast("dict[str, Any]", block).get("type") == "tool_result"
+            ]
+
+        empty: dict[str, Any] = {}
+        latest = next(
+            (
+                one
+                for one in reversed(messages)
+                if one.get("role") == "user" and (prompt(one) or tool_results(one))
+            ),
+            empty,
+        )
+        results = tool_results(latest)
+        said = prompt(latest).partition("\n")[0]
+        if said == "unfinished":
+            self._send(400, {"error": {"message": "it could not finish"}})
+            return
+        tools: list[dict[str, Any]] = asked.get("tools") or []
+        named = {"tools": [{"function": one} for one in tools]}
+        reach = self._reaching(named, said) if not results else ""
+        answer = (
+            "the tool said " + _text(results[-1].get("content")) if results else said
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def event(kind: str, **fields: Any) -> None:
+            data = json.dumps({"type": kind, **fields})
+            self.wfile.write(f"event: {kind}\ndata: {data}\n\n".encode())
+            self.wfile.flush()
+
+        event(
+            "message_start",
+            message={
+                "id": "msg-1",
+                "type": "message",
+                "role": "assistant",
+                "model": asked["model"],
+                "content": [],
+                "usage": {"input_tokens": 11, "output_tokens": 0},
+            },
+        )
+        if reach:
+            arguments = said.split(" ", 2)[2] if said.count(" ") >= 2 else "{}"
+            event(
+                "content_block_start",
+                index=0,
+                content_block={
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": reach,
+                    "input": {},
+                },
+            )
+            event(
+                "content_block_delta",
+                index=0,
+                delta={"type": "input_json_delta", "partial_json": arguments},
+            )
+        else:
+            event(
+                "content_block_start",
+                index=0,
+                content_block={"type": "text", "text": ""},
+            )
+            event(
+                "content_block_delta",
+                index=0,
+                delta={"type": "text_delta", "text": answer},
+            )
+        event("content_block_stop", index=0)
+        event(
+            "message_delta",
+            delta={"stop_reason": "tool_use" if reach else "end_turn"},
+            usage={"output_tokens": 7},
+        )
+        event("message_stop")
         self.close_connection = True
 
 

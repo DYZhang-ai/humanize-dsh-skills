@@ -59,6 +59,10 @@ _UNCONFINED = "danger-full-access"
 #: Where the runtime keeps its profiles and sessions, which the SDK never assumes.
 _HOME_ENV = "DSH_HOME"
 
+#: An installed CLI to use instead of the SDK's bundled runtime. Selection is explicit:
+#: an unavailable executable fails rather than silently running another DSH version.
+_BINARY_ENV = "HUMANIZE_DSH_BIN"
+
 #: How the JSONL session log is written, as `dsh-session-persistence-jsonl` spells it, and
 #: which of the two that plugin writes when nothing says. `zstd` is the SDK's own default;
 #: humanize asks for `none` so its running tally can read complete rows as they land, which
@@ -287,6 +291,9 @@ class DshAgentConfig(AgentConfig):
     profile with nothing of humanize's over it but what an account or a flow says.
 
     Attributes:
+      dsh_bin: An installed DSH executable, as a path or a name on PATH. Overrides
+        `HUMANIZE_DSH_BIN`; when neither is set, use the SDK's bundled runtime.
+        The selected executable must support the `sdk` profile and its JSON-RPC protocol.
       compaction: Whether the runtime's own automatic compaction is mounted --
         `dsh-compaction-basic` and `/compact`, at that plugin's own default threshold of 0.8
         of the context window. On is the SDK's default; off unmounts both, and a
@@ -306,11 +313,14 @@ class DshAgentConfig(AgentConfig):
         asks this path for, and it is a setting that is quietly wrong for any other.
     """
 
+    dsh_bin: str | None = None
     compaction: bool = True
     session_compression: str = "none"
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.dsh_bin is not None and not self.dsh_bin.strip():
+            raise ValueError("dsh_bin must name an executable")
         if self.session_compression not in _COMPRESSIONS:
             raise ValueError(
                 f"session_compression must be one of {', '.join(_COMPRESSIONS)}, "
@@ -319,7 +329,7 @@ class DshAgentConfig(AgentConfig):
 
 
 class DshAgent(AgentBase):
-    """A DeepSeek Harness agent using the bundled SDK runtime."""
+    """A DeepSeek Harness agent using an installed CLI or the SDK's bundled runtime."""
 
     #: The official goal service keeps the session working until its objective is complete.
     pursues: ClassVar[bool] = True
@@ -738,14 +748,14 @@ class DshSession(SessionBase):
             (Path(written.name) / _PATCH).write_text(composition, encoding="utf-8")
             if self._lodge(written):
                 (Path(written.name) / _BRIDGE).write_text(_BRIDGING, encoding="utf-8")
-            # The bundled runtime under the SDK's own profile with humanize's patch over it,
+            # The selected runtime under the SDK's own profile with humanize's patch over it,
             # wrapped in whatever `spawned` puts in front of it and in `env -u` where
             # credentials have to be dropped. Resolved here rather than by the SDK, which
             # resolves a launch only as the bare runtime -- so the profile, the patch and the
             # home it would have added are added here too.
             launch = self._agent.spawned(
                 [
-                    *_runtime_args(),
+                    *_runtime_args(cast("DshAgentConfig", self._agent.config).dsh_bin),
                     "--profile",
                     _PROFILE,
                     "--patch",
@@ -948,8 +958,18 @@ def _harness_type() -> Callable[..., _Harness]:
     return cast("Callable[..., _Harness]", vars(module)["DeepSeekHarness"])
 
 
-def _runtime_args() -> tuple[str, ...]:
-    """Resolves the executable bundled with the SDK."""
+def _runtime_args(configured: str | None = None) -> tuple[str, ...]:
+    """Resolves an explicitly selected executable, or the SDK bundle when none is named."""
+    binary = configured if configured is not None else os.environ.get(_BINARY_ENV)
+    if binary is not None:
+        found = shutil.which(str(Path(binary).expanduser())) if binary.strip() else None
+        if found is None:
+            raise FileNotFoundError(
+                f"DSH executable {binary!r} was not found or is not executable. "
+                f"Set {_BINARY_ENV} or dsh_bin to the installed DSH executable; "
+                "the bundled runtime was not used."
+            )
+        return (str(Path(found).absolute()),)
     try:
         module = importlib.import_module("deepseek_harness_runtime")
     except ModuleNotFoundError as why:

@@ -190,6 +190,7 @@ def dsh_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+    monkeypatch.delenv("HUMANIZE_DSH_BIN", raising=False)
     return home
 
 
@@ -288,6 +289,55 @@ def test_the_runtime_is_started_where_the_session_works_with_its_key(
     assert env["DEEPSEEK_API_KEY"] == "test-key"
     assert env["DSH_PERMISSION_MODE"] == "danger-full-access"
     assert Path(env["DSH_HOME"]).is_absolute()
+
+
+@pytest.mark.parametrize("selection", ["config", "environment", "path"])
+def test_an_installed_dsh_is_selected_without_importing_the_bundle(
+    made: Callable[..., DshAgent],
+    runtime: _Runtime,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selection: str,
+) -> None:
+    executable = tmp_path / "installed DSH" / "dsh"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.setitem(sys.modules, "deepseek_harness_runtime", None)
+    options: dict[str, str] = {}
+    if selection == "config":
+        options["dsh_bin"] = str(executable)
+        monkeypatch.setenv("HUMANIZE_DSH_BIN", "/missing/ignored-dsh")
+    elif selection == "environment":
+        monkeypatch.setenv("HUMANIZE_DSH_BIN", str(executable))
+    else:
+        monkeypatch.setenv("PATH", str(executable.parent))
+        monkeypatch.setenv("HUMANIZE_DSH_BIN", "dsh")
+
+    _turn(made(**options).new(tmp_path))
+
+    (harness,) = runtime.harnesses
+    assert harness.launch[-5:-1] == (str(executable), "--profile", "sdk", "--patch")
+
+
+@pytest.mark.parametrize("binary", ["", " ", "/missing/installed-dsh"])
+def test_an_unavailable_selected_dsh_does_not_fall_back_to_the_bundle(
+    made: Callable[..., DshAgent],
+    runtime: _Runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    binary: str,
+) -> None:
+    monkeypatch.setenv("HUMANIZE_DSH_BIN", binary)
+
+    with pytest.raises(Failed, match="bundled runtime was not used"):
+        _turn(made().new())
+
+    assert not runtime.harnesses
+
+
+def test_an_empty_configured_executable_is_rejected() -> None:
+    with pytest.raises(ValueError, match="dsh_bin must name an executable"):
+        DshAgentConfig(model="m", effort="", dsh_bin=" ")
 
 
 def test_a_session_keeps_its_runtime_across_turns_and_resumes_its_conversation(

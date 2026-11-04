@@ -1621,15 +1621,38 @@ cursor-agent --print --output-format stream-json --workspace <dir> --model <id>
 
 ### DeepSeek Harness {#deepseek-harness}
 
-`dsh`. Driven through `deepseek-harness-sdk` (`>=0.1.5rc1,<0.1.6`) in this process; no CLI.
+`dsh`. Driven through `deepseek-harness-sdk` (`>=0.1.5rc1,<0.1.6`) in this process. The SDK
+starts a DSH subprocess, using its bundled executable unless an installed CLI is selected.
 Models: `deepseek-v4-flash`, `deepseek-v4-pro`. Each runtime starts under the SDK's own `sdk`
 profile with one patch of humanize's over it, holding only what the agent's settings change; the
 effort goes in the handshake.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
+| `dsh_bin` | `None` | installed DSH executable, as a path or a name on `PATH`; overrides `HUMANIZE_DSH_BIN` |
 | `compaction` | `True` | keeps `dsh-compaction-basic` and `/compact`, compacting at 0.8 of the context window; `False` unmounts them |
 | `session_compression` | `"none"` | the session log's compression, `none` or `zstd` (the tally cannot read `zstd`) |
+
+To run the DSH already installed on this machine:
+
+```sh
+export HUMANIZE_DSH_BIN="$(command -v dsh)"
+hmz exec -f chat -a assistant=dsh/your-model:high 'Inspect this project'
+```
+
+An absolute executable path is preferred; `HUMANIZE_DSH_BIN=dsh` searches the current `PATH`.
+The executable is passed as one argument, never interpreted as a shell command. If the selected
+executable is missing or not executable, the turn fails without falling back to the bundled
+runtime. With neither `dsh_bin` nor `HUMANIZE_DSH_BIN` set, the SDK bundle remains the default.
+The Python SDK is still required when using an installed executable.
+
+The installed CLI must support `--profile sdk`, `--patch`, and the SDK's JSON-RPC protocol.
+This starts a new runtime under humanize's session home; it does not connect to an existing
+DSH Web server or automatically load that server's Web profile and plugins. The user's skill
+roots and the flow's selected skills are still provided by the skill adapter. Local Linux
+DSH `0.2.1-rc.5` is the external-runtime compatibility target; other versions and remote
+harness placement require separate validation. DSH 0.2's native DeepSeek provider uses the
+Messages API; an OpenAI-compatible endpoint should use humanize's OpenAI gateway account.
 
 - `goals` keeps the goal service, `create_goal`, `/goal` and the round driver; `False` unmounts
   them. Re-read every turn, so a reconfigured agent gets a rebuilt runtime.
