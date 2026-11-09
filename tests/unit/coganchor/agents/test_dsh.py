@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import types
 from dataclasses import dataclass, field
+from itertools import chain
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
@@ -24,12 +27,14 @@ from hmz.coganchor.agents import (
 from hmz.coganchor.agents.dsh import native_ready
 from hmz.coganchor.agents.event import Unrecoverable
 from hmz.coganchor.agents.skills import Loaded
+from hmz.coganchor.agents.watchdog import Watchdog
 from hmz.coganchor.providers import Provider
 
 from .doubles_u5 import configured, gatewayed, heard
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    import subprocess
+    from collections.abc import Callable, Iterable, Iterator
 
     from hmz.coganchor.agents.event import Event
 
@@ -102,13 +107,14 @@ class _Subscription:
 class _Client:
     def __init__(self, runtime: _Runtime) -> None:
         self._runtime = runtime
+        self._proc = runtime.process
 
     def subscribe_session_notifications(self, session_id: str) -> _Subscription:
         receipt = _event(session_id, "agent/inbox/spliced", inserted=[{"id": "msg-1"}])
         idle = _Notice("session.status", {"sessionId": session_id, "status": "idle"})
         noise = _event("someone-else", "turn/end", reason={"kind": "failed"})
-        said = [noise, receipt, *self._runtime.turn(session_id), idle]
-        return _Subscription(iter(said))
+        said = chain([noise, receipt], self._runtime.turn(session_id), [idle])
+        return _Subscription(said)
 
     def session_prompt(
         self,
@@ -151,7 +157,8 @@ def _option(argv: tuple[str, ...], flag: str) -> str:
 class _Runtime:
     """What the fake SDK was asked to do, and what it answers a turn with."""
 
-    turn: Callable[[str], list[_Notice]] = _completed
+    turn: Callable[[str], Iterable[_Notice]] = _completed
+    process: subprocess.Popen[str] | None = None
     refuses: Exception | None = None
     harnesses: list[_Harness] = field(default_factory=list[_Harness])
     prompts: list[tuple[str, list[dict[str, Any]]]] = field(
@@ -903,3 +910,73 @@ def test_skills_changed_between_turns_reach_the_same_runtime(
     assert not harness.closed
     assert len({asked for asked, _ in runtime.prompts}) == 1
     assert _lodged(harness) == {"review": ["SKILL.md"], "write": ["SKILL.md"]}
+
+
+def test_watchdog_is_given_the_sdk_runtime_process(
+    runtime: _Runtime, made: Callable[..., DshAgent], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime.process = cast("subprocess.Popen[str]", MagicMock())
+    observed: list[subprocess.Popen[str] | None] = []
+
+    def watching(
+        session: SessionBase,
+        *,
+        riding: Callable[[], subprocess.Popen[str] | None],
+    ) -> Watchdog:
+        observed.append(riding())
+        return Watchdog(session, window=0)
+
+    monkeypatch.setattr("hmz.coganchor.agents.dsh.Watchdog", watching)
+    assert made().new()("hello") == "done"
+    assert observed == [runtime.process]
+
+
+def test_parallel_silent_tools_are_held_until_the_last_result(
+    runtime: _Runtime, made: Callable[..., DshAgent], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HUMANIZE_WATCHDOG", "0.1")
+
+    def delayed(session: str) -> Iterator[_Notice]:
+        yield _event(session, "tool/call", callId="one", name="compile")
+        yield _event(session, "tool/call", callId="two", name="remote-job")
+        time.sleep(3.2)
+        yield _event(session, "tool/result", message={"source": {"callId": "one"}})
+        # An unrelated result cannot release the second call's hold.
+        yield _event(session, "tool/result", message={"source": {"callId": "other"}})
+        time.sleep(3.2)
+        yield _event(session, "tool/result", message={"source": {"callId": "two"}})
+        yield from _completed(session)
+
+    runtime.turn = delayed
+    agent = made()
+    notices = heard(agent)
+    assert agent.new()("long tools") == "done"
+    assert not any("said nothing" in event.text for event in notices)
+    assert not runtime.harnesses[0].closed
+
+
+@pytest.mark.parametrize("ending", ["result", "step", "turn"])
+def test_the_silence_clock_resumes_after_tools_end(
+    runtime: _Runtime,
+    made: Callable[..., DshAgent],
+    monkeypatch: pytest.MonkeyPatch,
+    ending: str,
+) -> None:
+    monkeypatch.setenv("HUMANIZE_WATCHDOG", "0.1")
+
+    def delayed(session: str) -> Iterator[_Notice]:
+        yield _event(session, "tool/call", callId="one", name="compile")
+        if ending == "result":
+            yield _event(session, "tool/result", message={"source": {"callId": "one"}})
+        else:
+            yield _event(session, ending + "/end", reason={"kind": "completed"})
+        time.sleep(3.2)
+        assert runtime.harnesses[0].closed
+        raise OSError("the SDK transport was closed")
+
+    runtime.turn = delayed
+    agent = made()
+    notices = heard(agent)
+    with pytest.raises(Failed):
+        agent.new()("the model stops answering after its tool")
+    assert any("said nothing" in event.text for event in notices)

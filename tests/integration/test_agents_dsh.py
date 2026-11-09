@@ -11,6 +11,7 @@ between the two.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -163,6 +164,33 @@ def test_a_callback_offered_is_run_here_when_the_model_reaches_for_it(
     assert said == "the tool said HI"
     offered = [one["function"]["name"] for one in endpoint.asked[0]["tools"]]
     assert "mcp__humanize__shout" in offered
+
+
+def test_a_silent_tool_outlives_the_watchdog_and_its_cpu_grace_windows(
+    endpoint: Endpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic import BaseModel
+
+    from hmz.coganchor.agents import FakeTool
+
+    class Asked(BaseModel):
+        word: str
+
+    def wait_for_io(asked: Asked) -> str:
+        time.sleep(10)
+        return asked.word.upper()
+
+    monkeypatch.setenv("HUMANIZE_WATCHDOG", "0.1")
+    agent = DshAgent(CONFIG)
+    try:
+        session = agent.new()
+        session.offers(
+            [FakeTool("wait_for_io", "Wait for a remote job.", wait_for_io, Asked)]
+        )
+        assert session('use wait_for_io {"word": "ready"}') == "the tool said READY"
+        assert session("the next turn") == "the next turn"
+    finally:
+        agent.stop()
 
 
 def test_a_new_effort_after_a_turn_is_refused_before_the_runtime_is(

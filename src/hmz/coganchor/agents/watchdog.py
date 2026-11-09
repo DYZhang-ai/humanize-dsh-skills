@@ -272,7 +272,13 @@ class Watchdog:
         #: fifteen minutes spent answering a permission prompt is not a wedge.
         self._holds = 0
         self._held = 0.0
-        self._holding = threading.Lock()
+        self._holding = threading.RLock()
+        # A read can arrive while the ticking thread is inspecting the process. Only a
+        # decision made against the current clock may interrupt it. Once an intervention
+        # starts, output may be its shutdown acknowledgement, not a recovered turn.
+        self._generation = 0
+        self._checking = 0
+        self._acted = False
         #: What was seen when the ladder started, which is the whole of the diagnostic.
         self._why = ""
         #: The process the ladder armed against, pinned rather than asked for again: a turn
@@ -351,15 +357,18 @@ class Watchdog:
         """The backend said something, so the clock starts again.
 
         Anything at all: this is liveness rather than progress, and a line that turned into no
-        event is still a CLI that is awake. Ignored once the ladder is being climbed -- a
-        backend that speaks up while it is being interrupted is a backend being interrupted,
-        and un-escalating there would leave the turn half stopped and running again.
+        event is still a CLI that is awake. A warning is reversible until an interrupt or
+        transport shutdown starts; output during shutdown does not undo that operation.
         """
-        if self._at is _Rung.LOOK:
+        with self._holding:
             now = time.monotonic()
             self._spoke = now
-            self._since = now
-            self._granted = 0
+            if not self._acted:
+                self._generation += 1
+                self._since = now
+                self._granted = 0
+                self._at = _Rung.LOOK
+                self._why = ""
 
     @contextlib.contextmanager
     def held(self) -> Generator[None]:
@@ -377,6 +386,9 @@ class Watchdog:
             self._holds += 1
             if self._holds == 1:
                 self._held = time.monotonic()
+                self._generation += 1
+                if not self._acted:
+                    self._at = _Rung.LOOK
         try:
             yield
         finally:
@@ -385,9 +397,11 @@ class Watchdog:
                 if self._holds == 0:
                     # Moved forward rather than restarted: what the backend owes is measured
                     # from when it last spoke, less whatever of that was spent on us.
-                    over = time.monotonic() - self._held
-                    self._spoke += over
-                    self._since += over
+                    now = time.monotonic()
+                    # Output can arrive during a hold (a tool result, for example). Only
+                    # the held time after that reading belongs on its new clock.
+                    self._spoke += now - max(self._held, self._spoke)
+                    self._since += now - max(self._held, self._since)
 
     def wedged(self) -> Failed | None:
         """What the watchdog decided, for a caller that ends the turn its own way.
@@ -400,20 +414,30 @@ class Watchdog:
     def _watching(self) -> None:
         """Ticks until the turn is over, taking one step each time the window runs out."""
         while not self._done.wait(_TICK):
-            if time.monotonic() - self._since < self._silence:
-                continue
-            if self._holds:
-                continue  # the turn is waiting on us rather than on its backend
-            # Each rung gets a window of its own to work in: a turn that ends because it
-            # was interrupted must not also be shot for taking a moment over it.
-            self._since = time.monotonic()
-            if self._done.is_set():
-                # The turn ended between the wait and here. Anything done now would be done
-                # to the next turn's process, which is the one thing worse than doing nothing.
-                return
-            self._at = self._stepped()
-            if self._at is _Rung.SPENT:
-                return
+            with self._holding:
+                if time.monotonic() - self._since < self._silence or self._holds:
+                    continue
+                # Each rung gets a window of its own to work in.
+                self._since = time.monotonic()
+                if self._done.is_set():
+                    return
+                self._checking = self._generation
+            after = self._stepped()
+            with self._holding:
+                if self._acted or self._checking == self._generation:
+                    self._at = after
+                if self._at is _Rung.SPENT:
+                    return
+
+    def _claim(self) -> bool:
+        """Commits an intervention only if no output or hold superseded its decision."""
+        with self._holding:
+            if self._acted:
+                return not self._done.is_set()
+            if self._done.is_set() or self._holds or self._checking != self._generation:
+                return False
+            self._acted = True
+            return True
 
     def _stepped(self) -> _Rung:
         """Takes the next step against a turn that has said nothing for a whole window.
@@ -444,10 +468,13 @@ class Watchdog:
           to stop would spend a whole window on nothing.
         """
         state = self._state()
-        if state is _State.WORKING and self._granted < _GRANTS:
-            self._granted += 1
-            self._says(f"has said nothing for {self._quiet()} but is still working")
-            return _Rung.LOOK
+        with self._holding:
+            if self._checking != self._generation or self._done.is_set():
+                return _Rung.LOOK
+            if state is _State.WORKING and self._granted < _GRANTS:
+                self._granted += 1
+                self._says(f"has said nothing for {self._quiet()} but is still working")
+                return _Rung.LOOK
         # What was seen goes in front of the silence, where there was anything to see: a
         # turn on a shared server has no process of its own, and "codex has no process" is a
         # sentence about this file rather than about what went wrong.
@@ -469,6 +496,8 @@ class Watchdog:
           way of being asked: a window spent waiting for something that was never sent is a
           window a person spends watching nothing happen.
         """
+        if not self._claim():
+            return _Rung.LOOK
         why = f"no output for {self._quiet()}"
         # Said before the asking rather than after it: asking is what frees the read, so the
         # turn's own thread may be out of it and reading why it stopped before this line
@@ -495,6 +524,8 @@ class Watchdog:
         Returns:
           The rung to be on afterwards.
         """
+        if not self._claim():
+            return _Rung.LOOK
         if not self._profile.restarts:
             # Nothing here may put this one down: whatever holds the turn open is somebody
             # else's, and reaching into it from a second thread breaks more than it frees.

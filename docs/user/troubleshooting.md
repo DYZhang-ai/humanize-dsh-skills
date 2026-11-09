@@ -792,7 +792,11 @@ the same conversation.
 before `has said nothing` say what it saw: `is gone` is a crash to look for in the CLI's own
 log, `is stopped` means something suspended it, and `is idle` means it was waiting on
 something that never answered. humanize looks at a turn after 15 minutes of complete silence,
-6 for DeepSeek Harness, and ends it unless the CLI is visibly busy.
+6 for DeepSeek Harness, with limited extra windows when the CLI or its descendants are visibly
+busy. Output resuming before an interrupt or shutdown starts cancels the pending intervention.
+For DeepSeek Harness, reported tool calls pause this silence clock until their results arrive;
+a quiet tool waiting on I/O is governed by its own timeout and the flow budget. A model that
+stops answering after the tools finish is watched again.
 
 **Fix.** If your turns really go quiet for longer, give them more room, in seconds, or `0` to
 turn this off:

@@ -2069,9 +2069,9 @@ PROFILES = (
         # through an SDK rather than a command line, and the three minutes the driver gives
         # each of that SDK's requests is humanize's own -- `request_timeout_seconds` is None
         # by default there, which is every request waiting for as long as it takes. What that
-        # bounds is the acknowledgement rather than the turn, so this is what bounds the turn:
-        # quiet for twice the acknowledgement is the runtime having stopped answering rather
-        # than the model still thinking, and there is nothing to wait for.
+        # bounds is the acknowledgement rather than the turn. This window starts inspecting
+        # unexplained silence; a known tool call pauses it until the result arrives, and the
+        # runtime's process tree is checked for CPU activity before an intervention.
         silence=360.0,
         # The whole of the `[dsh]` extra, named as its packages rather than as
         # `hmz[dsh]`: the humanize saying this did not come from an index, so a line

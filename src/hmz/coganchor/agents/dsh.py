@@ -446,10 +446,19 @@ class DshSession(SessionBase):
                 received = False
                 # Under a clock: `next` blocks on the SDK's own subscription, and a
                 # runtime that has stopped publishing without stopping never wakes it.
-                # No process is named -- what holds this turn is a runtime inside this
-                # interpreter -- so the watchdog closes it through `_lets_go`, which is
-                # what makes the subscription give up.
-                with Watchdog(self) as watch:
+                # The SDK owns a real subprocess. Its pinned client exposes it as _proc;
+                # older clients without that handle still get the transport fallback.
+                with (
+                    Watchdog(
+                        self,
+                        riding=lambda: cast(
+                            "subprocess.Popen[str] | None",
+                            getattr(harness.client, "_proc", None),
+                        ),
+                    ) as watch,
+                    contextlib.ExitStack() as tools,
+                ):
+                    pending: dict[str, contextlib.ExitStack] = {}
                     while True:
                         method, payload = _notification(subscribed.next())
                         watch.saw()  # anything at all: the runtime is answering
@@ -493,6 +502,19 @@ class DshSession(SessionBase):
                                     self._spends(usage)
                                     costing = costing + usage
                             elif kind == "tool/call":
+                                # A silent build, GPU job or remote request is not a silent
+                                # model. The tool's timeout and the flow budget bound its
+                                # execution; resume this clock after every pending result.
+                                identifier = data.get("callId")
+                                if (
+                                    isinstance(identifier, str)
+                                    and identifier not in pending
+                                ):
+                                    waiting = tools.enter_context(
+                                        contextlib.ExitStack()
+                                    )
+                                    waiting.enter_context(watch.held())
+                                    pending[identifier] = waiting
                                 # What it said before reaching for something is what says why
                                 # it reached, so the answer so far goes out ahead of the call.
                                 # The one being streamed, rather than whichever step this call
@@ -511,8 +533,19 @@ class DshSession(SessionBase):
                                             text=f"{name} {about}".rstrip(),
                                         )
                                     )
-                            elif kind == "turn/end":
-                                reason = _mapping(data.get("reason"))
+                            elif kind == "tool/result":
+                                message = _mapping(data.get("message"))
+                                source = _mapping(message.get("source"))
+                                identifier = source.get("callId")
+                                if isinstance(identifier, str):
+                                    waiting = pending.pop(identifier, None)
+                                    if waiting is not None:
+                                        waiting.close()
+                            elif kind in ("step/end", "turn/end"):
+                                tools.close()
+                                pending.clear()
+                                if kind == "turn/end":
+                                    reason = _mapping(data.get("reason"))
                         elif (
                             method == "session.status"
                             and payload.get("sessionId") == session_id

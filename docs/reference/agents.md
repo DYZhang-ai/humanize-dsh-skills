@@ -1413,7 +1413,7 @@ anything.
 | --- | --- |
 | Silence allowed | `Profile.silence`: 900 s; 360 s for `dsh` |
 | Override | `HUMANIZE_WATCHDOG=<seconds>`; `0` or less disables it |
-| Paused | while the turn waits on a person: a permission prompt, a question, a pausing hook |
+| Paused | while the turn waits on a person: a permission prompt, a question, a pausing hook; for `dsh`, while a reported tool call has not returned |
 
 When the clock runs out, in order:
 
@@ -1423,6 +1423,18 @@ When the clock runs out, in order:
 3. **Drop the transport**, signalling the process tree; on `codex` and `kimi` the shared server
    goes, ending the agent's other turns too, and that is said first.
 4. **Kill** what is left and wait.
+
+Output arriving after **Look**, before an interrupt or transport shutdown starts, cancels the
+pending intervention and starts a fresh silence window. Output received during shutdown cannot
+undo an interrupt that has already been sent.
+
+DeepSeek Harness's SDK starts a subprocess, which is included in the CPU check together with
+its descendants. A reported `tool/call` pauses its silence clock until the matching
+`tool/result`; concurrent calls keep it paused until all have returned. Step and turn endings
+also release outstanding holds. This allows quiet builds, GPU work and remote I/O to finish
+without treating their lack of output as a stalled model. Tool timeouts and the flow's budget
+still bound execution; the silence watchdog is not a tool execution timeout. Once the calls
+finish, model silence is watched again.
 
 Each step emits a `notice`, `<backend> …`: `has said nothing for <n>s but is still working`,
 `has said nothing for <n>s`, `was asked to stop: …`, `is not answering; ending it[; <id> is
