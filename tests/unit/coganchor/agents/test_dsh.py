@@ -931,6 +931,24 @@ def test_watchdog_is_given_the_sdk_runtime_process(
     assert observed == [runtime.process]
 
 
+def test_a_failed_turn_discards_an_sdk_runtime_whose_process_has_exited(
+    runtime: _Runtime, made: Callable[..., DshAgent]
+) -> None:
+    process = MagicMock()
+    process.pid = 999999999
+    process.poll.return_value = 1
+    runtime.process = cast("subprocess.Popen[str]", process)
+
+    def failed(session: str) -> Iterator[_Notice]:
+        yield _event(session, "tool/call", name="read")
+        raise Failed(1, ["dsh"], stderr="the watchdog stopped this turn")
+
+    runtime.turn = failed
+    with pytest.raises(Failed):
+        made().new()("a dead runtime")
+    assert runtime.harnesses[0].closed
+
+
 def test_parallel_silent_tools_are_held_until_the_last_result(
     runtime: _Runtime, made: Callable[..., DshAgent], monkeypatch: pytest.MonkeyPatch
 ) -> None:

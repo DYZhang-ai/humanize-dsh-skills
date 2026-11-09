@@ -451,10 +451,7 @@ class DshSession(SessionBase):
                 with (
                     Watchdog(
                         self,
-                        riding=lambda: cast(
-                            "subprocess.Popen[str] | None",
-                            getattr(harness.client, "_proc", None),
-                        ),
+                        riding=lambda: _runtime_process(harness),
                     ) as watch,
                     contextlib.ExitStack() as tools,
                 ):
@@ -606,7 +603,8 @@ class DshSession(SessionBase):
         Args:
           why: What the turn failed with.
         """
-        if _runtime_gone(why):
+        proc = _runtime_process(self._harness)
+        if _runtime_gone(why) or (proc is not None and proc.poll() is not None):
             self._shut()
 
     def _shows(self, event: Event) -> Event:
@@ -978,6 +976,15 @@ class DshSession(SessionBase):
         if composition is not None:
             with contextlib.suppress(Exception):
                 composition.cleanup()
+
+
+def _runtime_process(harness: _Harness | None) -> subprocess.Popen[str] | None:
+    """The pinned SDK's process handle, when this client makes one available."""
+    return (
+        cast("subprocess.Popen[str] | None", getattr(harness.client, "_proc", None))
+        if harness is not None
+        else None
+    )
 
 
 def _harness_type() -> Callable[..., _Harness]:
